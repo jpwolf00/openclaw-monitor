@@ -113,6 +113,26 @@ CONFIG: Dict[str, Any] = {
 
     # ── Process name of the openclaw gateway ─────────────────────────────
     "gateway_process_name": "openclaw-gateway",
+
+    # ── Token history ─────────────────────────────────────────────────────
+    # How often to recompute full token history by scanning all session files.
+    # 300s (5 min) balances freshness against disk I/O on large installs.
+    "history_cache_ttl_sec": 300,
+
+    # ── Runaway token detection ───────────────────────────────────────────
+    # Absolute spike: flag if this many tokens are used in the last 5 minutes.
+    # 50k is a reasonable ceiling for normal agent activity; a tight loop will
+    # blow past this quickly.
+    "runaway_abs_threshold": 50000,
+
+    # Rate anomaly multiplier: flag if last-hour token rate exceeds
+    # N × the agent's average hourly rate over the past week.
+    # Only fires when there is enough weekly history to compute a baseline.
+    "runaway_multiplier": 5.0,
+
+    # Consecutive assistant turns with zero output tokens → likely stuck in a
+    # silent retry loop (e.g. a local model returning empty responses).
+    "runaway_zero_output_turns": 5,
 }
 
 
@@ -382,6 +402,8 @@ def collect_network(gateway_pid: Optional[int], ip_service_map: Dict[str, str]) 
     """
     Run `ss -tiep` and return parsed connection list.
 
+    Filters out connections on the monitor's own port (self-connections
+    from browsers hitting the dashboard) so they don't pollute the view.
     Returns empty list if gateway is not running or ss fails.
     """
     if gateway_pid is None:
@@ -391,7 +413,9 @@ def collect_network(gateway_pid: Optional[int], ip_service_map: Dict[str, str]) 
             ["ss", "-tiep"],
             capture_output=True, text=True, timeout=5
         )
-        return parse_ss_output(result.stdout, gateway_pid, ip_service_map)
+        conns = parse_ss_output(result.stdout, gateway_pid, ip_service_map)
+        monitor_port = str(CONFIG["port"])
+        return [c for c in conns if not c["local"].endswith(f":{monitor_port}")]
     except Exception:
         return []
 
@@ -499,15 +523,18 @@ def parse_session_tail(session_file: Path, tail_bytes: int) -> Dict:
     Parsing only the tail keeps I/O fast even for multi-MB session files.
     """
     result = {
-        "last_tool":     None,
-        "last_tool_ts":  None,
-        "last_model":    None,
-        "last_provider": None,
-        "tokens_in":     None,
-        "tokens_out":    None,
-        "tokens_cache":  None,
-        "last_event_ts": None,
-        "session_id":    session_file.stem[:8],  # first 8 chars of UUID
+        "last_tool":          None,
+        "last_tool_ts":       None,
+        "last_model":         None,
+        "last_provider":      None,
+        "tokens_in":          None,
+        "tokens_out":         None,
+        "tokens_cache":       None,
+        "last_event_ts":      None,
+        "session_id":         session_file.stem[:8],  # first 8 chars of UUID
+        # How many consecutive assistant turns had zero output tokens.
+        # A non-zero streak indicates a silent retry loop.
+        "zero_output_streak": 0,
     }
 
     try:
@@ -550,6 +577,13 @@ def parse_session_tail(session_file: Path, tail_bytes: int) -> Dict:
                     result["tokens_in"]    = usage.get("input")
                     result["tokens_out"]   = usage.get("output")
                     result["tokens_cache"] = usage.get("cacheRead")
+
+                    # Track consecutive zero-output streak.
+                    # Reset on any turn that produces real output.
+                    if (usage.get("output") or 0) == 0:
+                        result["zero_output_streak"] += 1
+                    else:
+                        result["zero_output_streak"] = 0
 
                 # Capture the last tool call made
                 if isinstance(content, list):
@@ -716,6 +750,229 @@ def detect_stalls(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TOKEN HISTORY  (periodic full scan of all session files)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Cache so we don't rescan potentially hundreds of JSONL files every 2 seconds.
+_token_history_cache: Dict      = {}
+_token_history_lock              = threading.Lock()
+_token_history_computed_at: float = 0.0
+
+
+def compute_token_history(openclaw_dir: Path, agents: List[Dict]) -> Dict:
+    """
+    Scan every session JSONL file for every agent and aggregate token usage
+    into five time buckets: last 5 min, 1 hour, 24 hours, 7 days, 30 days.
+
+    Only files modified within the last 31 days are opened to bound I/O.
+    Lines are streamed one at a time — large files are handled gracefully.
+
+    Returns a dict with:
+      "entries"  — list of per-agent-model rows (for the table)
+      "totals"   — overall sums across all agents per bucket
+      "computed_at" — unix timestamp of this computation
+    """
+    import datetime
+
+    now = time.time()
+
+    # Time bucket cutoffs (seconds since epoch)
+    buckets = {
+        "5m":    now - 5   * 60,
+        "1h":    now - 60  * 60,
+        "day":   now - 24  * 60 * 60,
+        "week":  now - 7   * 24 * 60 * 60,
+        "month": now - 31  * 24 * 60 * 60,
+    }
+
+    def empty_bucket() -> Dict:
+        return {"input": 0, "output": 0, "cache": 0, "turns": 0}
+
+    # { "agent_id/model": { agent_id, agent_name, model, provider, 5m, 1h, ... } }
+    results: Dict[str, Dict] = {}
+
+    for agent in agents:
+        agent_id   = agent["id"]
+        agent_name = agent.get("name", agent_id)
+        sessions_dir = openclaw_dir / "agents" / agent_id / "sessions"
+        if not sessions_dir.is_dir():
+            continue
+
+        for session_file in sessions_dir.iterdir():
+            name = session_file.name
+            if not name.endswith(".jsonl"):
+                continue
+            if any(x in name for x in [".deleted", ".reset", ".lock"]):
+                continue
+            if name == "sessions.json":
+                continue
+
+            # Skip files older than 31 days — nothing useful in them
+            try:
+                if session_file.stat().st_mtime < buckets["month"]:
+                    continue
+            except OSError:
+                continue
+
+            try:
+                with open(session_file, errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        inner = msg.get("message", {})
+                        if inner.get("role") != "assistant":
+                            continue
+                        usage = inner.get("usage")
+                        if not usage:
+                            continue
+
+                        # Parse the message timestamp
+                        ts_str = msg.get("timestamp", "")
+                        try:
+                            ts = datetime.datetime.fromisoformat(
+                                ts_str.rstrip("Z").split(".")[0]
+                            ).timestamp()
+                        except Exception:
+                            continue
+
+                        # Skip anything outside our oldest bucket
+                        if ts < buckets["month"]:
+                            continue
+
+                        model    = inner.get("model", "unknown")
+                        provider = inner.get("provider", "")
+                        key      = f"{agent_id}/{model}"
+
+                        if key not in results:
+                            results[key] = {
+                                "agent_id":   agent_id,
+                                "agent_name": agent_name,
+                                "model":      model,
+                                "provider":   provider,
+                                **{b: empty_bucket() for b in buckets},
+                            }
+
+                        inp = usage.get("input",     0) or 0
+                        out = usage.get("output",    0) or 0
+                        cac = usage.get("cacheRead", 0) or 0
+
+                        for bucket_name, cutoff in buckets.items():
+                            if ts >= cutoff:
+                                results[key][bucket_name]["input"]  += inp
+                                results[key][bucket_name]["output"] += out
+                                results[key][bucket_name]["cache"]  += cac
+                                results[key][bucket_name]["turns"]  += 1
+
+            except Exception:
+                continue
+
+    # Compute overall totals across all agents
+    totals = {b: empty_bucket() for b in buckets}
+    for row in results.values():
+        for b in buckets:
+            for field in ("input", "output", "cache", "turns"):
+                totals[b][field] += row[b][field]
+
+    return {
+        "computed_at": now,
+        "entries":     list(results.values()),
+        "totals":      totals,
+    }
+
+
+def get_token_history(openclaw_dir: Path, agents: List[Dict]) -> Dict:
+    """
+    Return cached token history, recomputing if the cache has expired.
+    Thread-safe — safe to call from both the collector and HTTP threads.
+    """
+    global _token_history_cache, _token_history_computed_at
+
+    ttl = CONFIG["history_cache_ttl_sec"]
+    if time.time() - _token_history_computed_at > ttl:
+        history = compute_token_history(openclaw_dir, agents)
+        with _token_history_lock:
+            _token_history_cache      = history
+            _token_history_computed_at = time.time()
+
+    with _token_history_lock:
+        return dict(_token_history_cache)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUNAWAY TOKEN DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_runaway(history: Dict, sessions: List[Dict]) -> List[Dict]:
+    """
+    Detect agents with anomalous token consumption using the token history.
+
+    Three independent checks:
+
+    1. Absolute spike — tokens used in the last 5 minutes exceeds
+       CONFIG["runaway_abs_threshold"]. Catches tight loops immediately
+       regardless of history.
+
+    2. Rate anomaly — last-hour token rate is more than
+       CONFIG["runaway_multiplier"] × the agent's average hourly rate over
+       the past week. Only fires when weekly history exists (> 1000 tokens).
+
+    3. Zero-output streak — consecutive assistant turns with no output tokens,
+       detected from the session tail. The glm-4.7-flash silent retry pattern.
+    """
+    alerts = []
+    abs_threshold  = CONFIG["runaway_abs_threshold"]
+    multiplier     = CONFIG["runaway_multiplier"]
+    zero_threshold = CONFIG["runaway_zero_output_turns"]
+
+    # ── Checks 1 & 2: token rate from history ────────────────────────────
+    for entry in history.get("entries", []):
+        agent_label = f"{entry['agent_name']} / {entry['model']}"
+
+        tokens_5m   = entry["5m"]["input"]   + entry["5m"]["output"]
+        tokens_1h   = entry["1h"]["input"]   + entry["1h"]["output"]
+        tokens_week = entry["week"]["input"]  + entry["week"]["output"]
+
+        # Check 1: absolute spike in the last 5 minutes
+        if tokens_5m >= abs_threshold:
+            alerts.append({
+                "level":    "critical",
+                "category": "runaway",
+                "message":  f"Token spike: {agent_label} used {fmt_num(tokens_5m)} tokens in last 5 min",
+                "detail":   f"threshold: {fmt_num(abs_threshold)} tokens/5min",
+            })
+
+        # Check 2: rate anomaly vs weekly baseline
+        # baseline_per_hour = weekly total / (7 days × 24 hours)
+        baseline_per_hour = tokens_week / (7 * 24) if tokens_week > 1000 else 0
+        if baseline_per_hour > 0 and tokens_1h > baseline_per_hour * multiplier:
+            alerts.append({
+                "level":    "warning",
+                "category": "runaway",
+                "message":  f"Above-baseline rate: {agent_label} — {fmt_num(tokens_1h)} tokens/hr (avg: {fmt_num(int(baseline_per_hour))})",
+                "detail":   f"{multiplier}× weekly average threshold",
+            })
+
+    # ── Check 3: zero-output streak from session tail ─────────────────────
+    for sess in sessions:
+        streak = sess.get("zero_output_streak", 0)
+        if streak >= zero_threshold:
+            alerts.append({
+                "level":    "critical",
+                "category": "runaway",
+                "message":  f"Silent retry loop: {sess['agent_name']} — {streak} consecutive turns with zero output",
+                "detail":   f"model: {sess.get('last_model', '?')}  session: {sess.get('session_id', '?')}",
+            })
+
+    return alerts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FORMATTING HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -785,19 +1042,25 @@ def build_state(openclaw_dir: Path, agents: List[Dict], ip_map: Dict[str, str]) 
     sessions    = collect_sessions(openclaw_dir, agents)
     alerts      = detect_stalls(network, processes, sessions)
 
+    # Token history is cached (recomputed every history_cache_ttl_sec).
+    # detect_runaway adds its alerts to the same alerts list.
+    history = get_token_history(openclaw_dir, agents)
+    alerts += detect_runaway(history, sessions)
+
     # Annotate sessions with human-readable "X ago" strings
     for sess in sessions:
         ts = sess.get("last_event_ts")
         sess["last_event_ago"] = seconds_ago(ts)
 
     return {
-        "ts":          int(time.time()),
-        "gateway_pid": gateway_pid,
-        "gateway_up":  gateway_pid is not None,
-        "network":     network,
-        "processes":   processes,
-        "sessions":    sessions,
-        "alerts":      alerts,
+        "ts":            int(time.time()),
+        "gateway_pid":   gateway_pid,
+        "gateway_up":    gateway_pid is not None,
+        "network":       network,
+        "processes":     processes,
+        "sessions":      sessions,
+        "alerts":        alerts,
+        "token_history": history,
     }
 
 
@@ -1044,6 +1307,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </table>
 </section>
 
+<!-- TOKEN USAGE -->
+<section>
+  <h2>Token Usage  <span style="font-size:10px;color:var(--muted);font-weight:normal;margin-left:8px">refreshes every 5 min — in / out</span></h2>
+  <table>
+    <thead><tr>
+      <th>Agent</th><th>Model</th>
+      <th>Last Hour</th><th>Last Day</th><th>Last Week</th><th>Last Month</th>
+    </tr></thead>
+    <tbody id="tokens-body"><tr class="empty-row"><td colspan="6">Computing token history…</td></tr></tbody>
+  </table>
+</section>
+
 <footer id="footer">—</footer>
 
 <script>
@@ -1177,6 +1452,44 @@ function renderProcesses(procs) {
   }).join('');
 }
 
+// ── Token usage table ────────────────────────────────────────────────────────
+
+function fmtTok(n) {
+  if (!n) return '<span class="muted">0</span>';
+  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+  if (n >= 1000)    return (n/1000).toFixed(1) + 'k';
+  return String(n);
+}
+
+function renderTokens(history) {
+  const tbody = document.getElementById('tokens-body');
+  if (!history || !history.entries || history.entries.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No data yet — history scans every 5 min</td></tr>';
+    return;
+  }
+  const entries = history.entries.slice().sort((a, b) =>
+    (a.agent_name + a.model).localeCompare(b.agent_name + b.model)
+  );
+  function cell(e, bucket) {
+    const inp = e[bucket] ? e[bucket].input  : 0;
+    const out = e[bucket] ? e[bucket].output : 0;
+    if (!inp && !out) return '<span class="muted">—</span>';
+    return `<span title="${Number(inp).toLocaleString()} in">${fmtTok(inp)}</span>`
+         + ' <span class="muted">/</span> '
+         + `<span title="${Number(out).toLocaleString()} out">${fmtTok(out)}</span>`;
+  }
+  tbody.innerHTML = entries.map(e => `
+    <tr>
+      <td><strong>${esc(e.agent_name)}</strong></td>
+      <td class="muted" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(e.model)}">${esc(e.model)}</td>
+      <td class="mono">${cell(e,'1h')}</td>
+      <td class="mono">${cell(e,'day')}</td>
+      <td class="mono">${cell(e,'week')}</td>
+      <td class="mono">${cell(e,'month')}</td>
+    </tr>`).join('');
+}
+
 // ── SSE connection with auto-reconnect ───────────────────────────────────────
 
 let lastUpdateTs = null;
@@ -1210,6 +1523,7 @@ function connect() {
     renderAgents(state.sessions);
     renderNetwork(state.network);
     renderProcesses(state.processes);
+    renderTokens(state.token_history);
 
     const d = new Date(state.ts * 1000);
     document.getElementById('footer').textContent =
