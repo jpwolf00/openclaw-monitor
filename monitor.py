@@ -1295,10 +1295,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <h2>Network Connections</h2>
   <table>
     <thead><tr>
-      <th>Service</th><th>Remote</th><th>↑ Sent</th><th>↓ Recv</th>
-      <th>Last RX</th><th>TX Queue</th><th>Timer</th><th>Status</th>
+      <th>Service</th><th>Conns</th><th>↑ Sent</th><th>↓ Recv</th>
+      <th>Last RX</th><th>Status</th>
     </tr></thead>
-    <tbody id="network-body"><tr class="empty-row"><td colspan="8">Waiting for data…</td></tr></tbody>
+    <tbody id="network-body" style="min-height:40px"><tr class="empty-row"><td colspan="6">Waiting for data…</td></tr></tbody>
   </table>
 </section>
 
@@ -1420,19 +1420,47 @@ function renderAgents(sessions) {
 function renderNetwork(conns) {
   const tbody = document.getElementById('network-body');
   if (!conns || conns.length === 0) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No connections (gateway down?)</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No connections (gateway down?)</td></tr>';
     return;
   }
-  tbody.innerHTML = conns.map(c => `
+
+  // Aggregate per-socket data into one stable row per service.
+  // Individual sockets open/close constantly; service rows are stable.
+  const byService = {};
+  for (const c of conns) {
+    const svc = c.service || c.remote;
+    if (!byService[svc]) {
+      byService[svc] = { service: svc, count: 0, bytes_sent: 0, bytes_received: 0, worst_lastrcv: null };
+    }
+    const g = byService[svc];
+    g.count++;
+    g.bytes_sent     += c.bytes_sent     || 0;
+    g.bytes_received += c.bytes_received || 0;
+    if (c.lastrcv_ms !== null && c.lastrcv_ms !== undefined) {
+      g.worst_lastrcv = g.worst_lastrcv === null ? c.lastrcv_ms : Math.max(g.worst_lastrcv, c.lastrcv_ms);
+    }
+  }
+
+  // Stable sort by service name so rows never jump around
+  const rows = Object.values(byService).sort((a, b) => a.service.localeCompare(b.service));
+
+  function svcStatusPill(g) {
+    const rcv = g.worst_lastrcv;
+    if (rcv === null)    return '<span class="pill pill-gray">idle</span>';
+    if (rcv < 5000)      return '<span class="pill pill-green">active</span>';
+    if (rcv >= CRIT_MS)  return '<span class="pill pill-red">stalled?</span>';
+    if (rcv >= WARN_MS)  return '<span class="pill pill-yellow">slow</span>';
+    return '<span class="pill pill-gray">waiting</span>';
+  }
+
+  tbody.innerHTML = rows.map(g => `
     <tr>
-      <td><strong>${esc(c.service)}</strong></td>
-      <td class="muted mono" style="font-size:11px">${esc(c.remote)}</td>
-      <td class="mono">${esc(c.bytes_sent    !== null ? fmtBytes(c.bytes_sent)    : null)}</td>
-      <td class="mono">${esc(c.bytes_received !== null ? fmtBytes(c.bytes_received) : null)}</td>
-      <td class="mono">${fmtMs(c.lastrcv_ms)}</td>
-      <td class="mono">${c.tx_queue > 0 ? '<span style="color:var(--yellow)">'+c.tx_queue+'B</span>' : '<span class="muted">0</span>'}</td>
-      <td class="muted">${esc(c.timer) || '—'}</td>
-      <td>${connStatusPill(c)}</td>
+      <td><strong>${esc(g.service)}</strong></td>
+      <td class="muted">${g.count}</td>
+      <td class="mono">${fmtBytes(g.bytes_sent)}</td>
+      <td class="mono">${fmtBytes(g.bytes_received)}</td>
+      <td class="mono">${g.worst_lastrcv !== null ? fmtMs(g.worst_lastrcv) : '<span class="muted">—</span>'}</td>
+      <td>${svcStatusPill(g)}</td>
     </tr>`).join('');
 }
 
