@@ -532,6 +532,7 @@ def parse_session_tail(session_file: Path, tail_bytes: int) -> Dict:
         "tokens_cache":       None,
         "last_event_ts":      None,
         "session_id":         session_file.stem[:8],  # first 8 chars of UUID
+        "last_thought":       None,
         # How many consecutive assistant turns had zero output tokens.
         # A non-zero streak indicates a silent retry loop.
         "zero_output_streak": 0,
@@ -585,10 +586,14 @@ def parse_session_tail(session_file: Path, tail_bytes: int) -> Dict:
                     else:
                         result["zero_output_streak"] = 0
 
-                # Capture the last tool call made
+                # Capture last text (thinking) and last tool call
                 if isinstance(content, list):
                     for block in content:
-                        if block.get("type") == "toolCall":
+                        if block.get("type") == "text":
+                            text = (block.get("text") or "").strip()
+                            if text:
+                                result["last_thought"] = text
+                        elif block.get("type") == "toolCall":
                             result["last_tool"]    = block.get("name")
                             result["last_tool_ts"] = ts
 
@@ -640,6 +645,7 @@ def collect_sessions(openclaw_dir: Path, agents: List[Dict]) -> List[Dict]:
                 "tokens_cache":  None,
                 "last_event_ts": None,
                 "session_id":    None,
+                "last_thought":  None,
             })
 
         sessions.append(entry)
@@ -1276,9 +1282,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <h2>Agents</h2>
   <table>
     <thead><tr>
-      <th>Agent</th><th>Status</th><th>Model</th>
-      <th>Tokens In</th><th>Tokens Out</th><th>Cache</th>
-      <th>Last Tool</th><th>Last Event</th>
+      <th>Agent</th><th>Last Event</th><th>Model</th>
+      <th>In</th><th>Out</th><th>Cache</th>
+      <th>Last Tool</th><th>Thinking</th>
     </tr></thead>
     <tbody id="agents-body"><tr class="empty-row"><td colspan="8">Waiting for data…</td></tr></tbody>
   </table>
@@ -1393,18 +1399,22 @@ function renderAgents(sessions) {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No agents configured</td></tr>';
     return;
   }
-  tbody.innerHTML = sessions.map(s => `
-    <tr>
+  tbody.innerHTML = sessions.map(s => {
+    const thought = s.last_thought || '';
+    const thoughtShort = thought.length > 120 ? thought.slice(0,120) + '…' : thought;
+    return `<tr>
       <td>${agentStatusDot(s)}<strong>${esc(s.agent_name)}</strong>
           <br><span class="muted" style="font-size:11px">${esc(s.session_id)}</span></td>
-      <td>${s.session_id ? fmtAgo(s.last_event_ago) : '<span class="muted">no session</span>'}</td>
-      <td>${esc(s.last_model)} <span class="muted">${esc(s.last_provider)}</span></td>
-      <td class="mono">${esc(s.tokens_in  !== null ? Number(s.tokens_in).toLocaleString()  : null)}</td>
-      <td class="mono">${esc(s.tokens_out !== null ? Number(s.tokens_out).toLocaleString() : null)}</td>
+      <td class="muted">${s.session_id ? fmtAgo(s.last_event_ago) : '<span class="muted">no session</span>'}</td>
+      <td style="font-size:11px">${esc(s.last_model)}<br><span class="muted">${esc(s.last_provider)}</span></td>
+      <td class="mono">${esc(s.tokens_in   !== null ? Number(s.tokens_in).toLocaleString()    : null)}</td>
+      <td class="mono">${esc(s.tokens_out  !== null ? Number(s.tokens_out).toLocaleString()   : null)}</td>
       <td class="mono">${esc(s.tokens_cache !== null ? Number(s.tokens_cache).toLocaleString() : null)}</td>
-      <td>${esc(s.last_tool)}</td>
-      <td class="muted">${fmtAgo(s.last_event_ago)}</td>
-    </tr>`).join('');
+      <td style="font-size:11px">${esc(s.last_tool)}</td>
+      <td style="font-size:11px;max-width:320px;color:var(--text)"
+          title="${thought.replace(/"/g,'&quot;')}">${esc(thoughtShort) || '<span class="muted">—</span>'}</td>
+    </tr>`;
+  }).join('');
 }
 
 function renderNetwork(conns) {
