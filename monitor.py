@@ -74,6 +74,11 @@ CONFIG: Dict[str, Any] = {
     # Dashboard web server port
     "port": 7890,
 
+    # Bind address. "0.0.0.0" listens on all interfaces so the dashboard
+    # is reachable from other machines on your network (recommended).
+    # Change to "127.0.0.1" to restrict to localhost only.
+    "bind": "0.0.0.0",
+
     # Seconds between data refreshes
     "update_interval": 2,
 
@@ -1292,7 +1297,21 @@ def main():
     print(f"  gateway pid  : {find_gateway_pid() or 'not running'}")
     print(f"  agents       : {[a['id'] for a in agents]}")
     print(f"  interval     : {CONFIG['update_interval']}s")
-    print(f"  dashboard    : http://localhost:{CONFIG['port']}")
+    # Resolve the machine's LAN IP for a useful clickable URL in the output.
+    # Uses a UDP connect trick (no packets sent) to find which local interface
+    # would be used to reach the broader network. Falls back gracefully.
+    try:
+        if CONFIG["bind"] == "127.0.0.1":
+            display_host = "localhost"
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            display_host = s.getsockname()[0]
+            s.close()
+    except Exception:
+        display_host = CONFIG["bind"] or "localhost"
+    print(f"  bind         : {CONFIG['bind']}:{CONFIG['port']}")
+    print(f"  dashboard    : http://{display_host}:{CONFIG['port']}")
     print()
 
     # Start background data collector
@@ -1304,7 +1323,7 @@ def main():
     t.start()
 
     # Start HTTP server (blocking)
-    server = HTTPServer(("", CONFIG["port"]), MonitorHandler)
+    server = HTTPServer((CONFIG["bind"], CONFIG["port"]), MonitorHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
