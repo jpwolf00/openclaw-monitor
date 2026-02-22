@@ -51,6 +51,7 @@ Dependencies
 import argparse
 import json
 import os
+import platform
 import re
 import socket
 import subprocess
@@ -60,6 +61,8 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+IS_MACOS = platform.system() == "Darwin"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,6 +111,9 @@ CONFIG: Dict[str, Any] = {
         "nano-gpt":  "NanoGPT",   # matched against hostname too
         "openai":    "OpenAI",
         "anthropic": "Anthropic",
+        "kimi":      "Kimi",
+        "googleapis": "Google/Gemini",
+        "maton":     "Maton",
         "127.0.0.1": "Localhost",
     },
 
@@ -262,7 +268,98 @@ def build_ip_service_map(openclaw_dir: Path) -> Dict[str, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NETWORK COLLECTOR  (ss -tiep)
+# PLATFORM HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_etime(etime: str) -> int:
+    """
+    Parse BSD ps etime format [[dd-]hh:]mm:ss into integer seconds.
+
+    macOS ps reports elapsed time as a formatted string rather than a raw
+    seconds integer (which Linux ps provides via the 'etimes' keyword).
+
+    Examples:
+      "05"          →    5  (just seconds, very new process)
+      "01:23"       →   83  (mm:ss)
+      "01:02:03"    → 3723  (hh:mm:ss)
+      "2-03:04:05"  → 183845 (dd-hh:mm:ss)
+    """
+    try:
+        days = 0
+        if "-" in etime:
+            day_str, etime = etime.split("-", 1)
+            days = int(day_str)
+        parts = etime.split(":")
+        if len(parts) == 3:
+            return days * 86400 + int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        elif len(parts) == 2:
+            return days * 86400 + int(parts[0]) * 60 + int(parts[1])
+        else:
+            return days * 86400 + int(parts[0])
+    except Exception:
+        return 0
+
+
+def parse_lsof_output(raw: str, gateway_pid: int, ip_service_map: Dict[str, str]) -> List[Dict]:
+    """
+    Parse `lsof -i TCP -n -P -p <pid>` output into connection dicts.
+
+    Used on macOS in place of `ss -tiep`.  lsof does not expose per-socket
+    byte counters or TCP timing (lastsnd / lastrcv), so those fields are
+    set to None.  The network stall detection in detect_stalls() already
+    skips connections where lastrcv_ms is None, so stall alerts simply will
+    not fire from the network panel on macOS — session freshness remains the
+    primary stall indicator.
+
+    lsof NAME field format (with -n -P flags):
+      192.168.1.10:52000->104.18.27.45:443 (ESTABLISHED)
+
+    On some macOS versions the separator between IP and port may be "." rather
+    than ":" — both are handled by lsof_addr_to_std().
+    """
+    def lsof_addr_to_std(addr: str) -> str:
+        """Normalise macOS lsof addr (may use . before port) to ip:port."""
+        m = re.match(r'^(\d+\.\d+\.\d+\.\d+)[.:](\d+)$', addr)
+        return f"{m.group(1)}:{m.group(2)}" if m else addr
+
+    connections = []
+    for line in raw.splitlines():
+        if "->" not in line:
+            continue
+        m = re.search(r'([\d.]+[.:]\d+)->([\d.]+[.:]\d+)\s*\((\w+)\)', line)
+        if not m:
+            continue
+        local  = lsof_addr_to_std(m.group(1))
+        remote = lsof_addr_to_std(m.group(2))
+        state  = m.group(3)
+        if state != "ESTABLISHED":
+            continue
+        parts = line.split()
+        try:
+            pid = int(parts[1])
+        except (IndexError, ValueError):
+            pid = None
+        service = resolve_service(remote, ip_service_map)
+        connections.append({
+            "state":          state,
+            "local":          local,
+            "remote":         remote,
+            "service":        service,
+            "pid":            pid,
+            "fd":             None,
+            "tx_queue":       0,
+            "rx_queue":       0,
+            "bytes_sent":     None,
+            "bytes_received": None,
+            "lastsnd_ms":     None,   # not available via lsof
+            "lastrcv_ms":     None,   # not available via lsof
+            "timer":          "",
+        })
+    return connections
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NETWORK COLLECTOR  (ss -tiep / lsof)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_service(remote_addr: str, ip_service_map: Dict[str, str]) -> str:
@@ -400,20 +497,33 @@ def parse_ss_output(raw: str, gateway_pid: int, ip_service_map: Dict[str, str]) 
 
 def collect_network(gateway_pid: Optional[int], ip_service_map: Dict[str, str]) -> List[Dict]:
     """
-    Run `ss -tiep` and return parsed connection list.
+    Return parsed TCP connection list for the openclaw-gateway process.
+
+    Linux:  runs `ss -tiep` which exposes per-socket byte counters and TCP
+            timing (lastsnd / lastrcv) used for network stall detection.
+    macOS:  runs `lsof -i TCP -n -P -p <pid>`.  Byte counters and timing
+            are not available via lsof, so network stall alerts are silent
+            on macOS — session freshness is the primary stall indicator.
 
     Filters out connections on the monitor's own port (self-connections
     from browsers hitting the dashboard) so they don't pollute the view.
-    Returns empty list if gateway is not running or ss fails.
+    Returns empty list if gateway is not running or the command fails.
     """
     if gateway_pid is None:
         return []
     try:
-        result = subprocess.run(
-            ["ss", "-tiep"],
-            capture_output=True, text=True, timeout=5
-        )
-        conns = parse_ss_output(result.stdout, gateway_pid, ip_service_map)
+        if IS_MACOS:
+            result = subprocess.run(
+                ["lsof", "-i", "TCP", "-n", "-P", "-p", str(gateway_pid)],
+                capture_output=True, text=True, timeout=5
+            )
+            conns = parse_lsof_output(result.stdout, gateway_pid, ip_service_map)
+        else:
+            result = subprocess.run(
+                ["ss", "-tiep"],
+                capture_output=True, text=True, timeout=5
+            )
+            conns = parse_ss_output(result.stdout, gateway_pid, ip_service_map)
         monitor_port = str(CONFIG["port"])
         return [c for c in conns if not c["local"].endswith(f":{monitor_port}")]
     except Exception:
@@ -431,6 +541,12 @@ def collect_processes(gateway_pid: Optional[int]) -> List[Dict]:
     These are typically bash commands launched by the agent's `exec` tool.
     Long-running children are the most common source of stalls.
 
+    Linux:  `ps --ppid <pid>` with GNU ps keywords (etimes gives raw seconds).
+    macOS:  `ps -ax` with BSD ps keywords (etime gives formatted string);
+            we scan all processes and filter by ppid ourselves since BSD ps
+            has no --ppid equivalent.  parse_etime() converts the formatted
+            string to seconds.
+
     Returned dict keys:
       pid, ppid, stat, elapsed_sec, elapsed_str, command
     """
@@ -438,38 +554,62 @@ def collect_processes(gateway_pid: Optional[int]) -> List[Dict]:
         return []
 
     processes = []
+
+    def _make_entry(pid, ppid, stat, elapsed_sec, command):
+        if elapsed_sec < 60:
+            elapsed_str = f"{elapsed_sec}s"
+        elif elapsed_sec < 3600:
+            elapsed_str = f"{elapsed_sec // 60}m {elapsed_sec % 60}s"
+        else:
+            elapsed_str = f"{elapsed_sec // 3600}h {(elapsed_sec % 3600) // 60}m"
+        return {
+            "pid":         pid,
+            "ppid":        ppid,
+            "stat":        stat,
+            "elapsed_sec": elapsed_sec,
+            "elapsed_str": elapsed_str,
+            "command":     command[:120],
+        }
+
     try:
-        result = subprocess.run(
-            ["ps", "--ppid", str(gateway_pid), "-o", "pid,ppid,stat,etimes,comm,args",
-             "--no-headers"],
-            capture_output=True, text=True, timeout=5
-        )
-        for line in result.stdout.strip().splitlines():
-            parts = line.split(None, 5)
-            if len(parts) < 5:
-                continue
-            pid     = int(parts[0])
-            ppid    = int(parts[1])
-            stat    = parts[2]
-            elapsed = int(parts[3]) if parts[3].isdigit() else 0
-            command = parts[5] if len(parts) > 5 else parts[4]
-
-            # Format elapsed time as human-readable
-            if elapsed < 60:
-                elapsed_str = f"{elapsed}s"
-            elif elapsed < 3600:
-                elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
-            else:
-                elapsed_str = f"{elapsed // 3600}h {(elapsed % 3600) // 60}m"
-
-            processes.append({
-                "pid":         pid,
-                "ppid":        ppid,
-                "stat":        stat,
-                "elapsed_sec": elapsed,
-                "elapsed_str": elapsed_str,
-                "command":     command[:120],  # cap length for display
-            })
+        if IS_MACOS:
+            # BSD ps: dump all processes; filter by ppid in Python.
+            # "pid=,ppid=,..." syntax suppresses column headers per-field.
+            result = subprocess.run(
+                ["ps", "-ax", "-o", "pid=,ppid=,stat=,etime=,comm=,args="],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.strip().splitlines():
+                parts = line.split(None, 5)
+                if len(parts) < 5:
+                    continue
+                try:
+                    ppid = int(parts[1])
+                except ValueError:
+                    continue
+                if ppid != gateway_pid:
+                    continue
+                pid     = int(parts[0])
+                stat    = parts[2]
+                elapsed = parse_etime(parts[3])
+                command = parts[5] if len(parts) > 5 else parts[4]
+                processes.append(_make_entry(pid, ppid, stat, elapsed, command))
+        else:
+            result = subprocess.run(
+                ["ps", "--ppid", str(gateway_pid), "-o", "pid,ppid,stat,etimes,comm,args",
+                 "--no-headers"],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.strip().splitlines():
+                parts = line.split(None, 5)
+                if len(parts) < 5:
+                    continue
+                pid     = int(parts[0])
+                ppid    = int(parts[1])
+                stat    = parts[2]
+                elapsed = int(parts[3]) if parts[3].isdigit() else 0
+                command = parts[5] if len(parts) > 5 else parts[4]
+                processes.append(_make_entry(pid, ppid, stat, elapsed, command))
     except Exception:
         pass
 
@@ -661,7 +801,8 @@ def collect_sessions(openclaw_dir: Path, agents: List[Dict]) -> List[Dict]:
 # Connections to these services are what we watch for response stalls.
 MODEL_API_FRAGMENTS = [
     "minimax", "openai", "anthropic", "nanogpt", "nano-gpt",
-    "ollama", "together", "groq", "mistral", "gemini",
+    "ollama", "together", "groq", "mistral", "gemini", "googleapis",
+    "kimi", "maton",
 ]
 
 def is_model_api(service: str) -> bool:
